@@ -23,6 +23,14 @@ local values = {0.5, 0.5, 0.5, 0.5, 0.5, 0.5}
 local rand_flash = 0.0
 local rand_timer = 0.0
 
+-- beat phase for animation and pulse effects
+local beat_phase = 0.0
+
+-- popup state for parameter display
+local popup_param = nil
+local popup_val = 0.0
+local popup_time = 0.0
+
 -- page definitions: display info + randomize ranges
 local pages = {
   { name="granular morph",    label="POSITION", desc="grain pos + rate",       rand_lo=0.10, rand_hi=0.90 },
@@ -43,6 +51,7 @@ local scene_a = {}
 local scene_b = {}
 local scene_morphing = false
 local morph_blend = 0.0  -- 0=scene_a, 1=scene_b
+local freeze_state = false
 
 -- send current page value to engine
 -- the engine handles page switching internally when it sees
@@ -127,35 +136,220 @@ local function swap_effects(slot1, slot2)
   effect_order[slot2] = temp
 end
 
-local function draw_bar(v)
-  local bw = 90
-  local bx = 19
-  local by = 43
-  local bh = 3
+-- draw spectral bars in the live zone
+local function draw_spectral_bars()
+  local num_bars = 28
+  local bar_width = 4
+  local bar_gap = 0.5
+  local zone_x = 2
+  local zone_y = 9
+  local zone_height = 44
+  
+  local total_width = num_bars * (bar_width + bar_gap)
+  local start_x = zone_x + (128 - total_width) / 2
+  
+  for i = 1, num_bars do
+    local x = start_x + (i - 1) * (bar_width + bar_gap)
+    
+    -- derive bar height from effect parameter with beat animation
+    local param_influence = values[page]
+    local beat_variation = 0.3 * math.sin(beat_phase * 2 * math.pi)
+    local normalized_height = util.clamp(param_influence + beat_variation, 0.1, 1.0)
+    
+    -- determine if this bar is in active effect's frequency range (highlight)
+    local is_active_range = (i / num_bars) >= (1 - param_influence - 0.2) and 
+                            (i / num_bars) <= (1 - param_influence + 0.2)
+    
+    local bar_height = math.floor(normalized_height * zone_height)
+    local bar_y = zone_y + zone_height - bar_height
+    
+    -- draw bar with graduated brightness
+    local base_level = is_active_range and 9 or 4
+    local top_level = is_active_range and 15 or 12
+    
+    -- dimmer base
+    screen.level(base_level)
+    screen.rect(x, bar_y + bar_height - 2, bar_width, 2)
+    screen.fill()
+    
+    -- brighter middle
+    screen.level(base_level + 2)
+    screen.rect(x, bar_y + 2, bar_width, bar_height - 4)
+    screen.fill()
+    
+    -- brightest top
+    screen.level(top_level)
+    screen.rect(x, bar_y, bar_width, 2)
+    screen.fill()
+  end
+end
+
+-- draw scene morph visualization
+local function draw_scene_morph()
+  if not scene_morphing then return end
+  
+  local morph_y = 27
+  local morph_width = 100
+  local morph_x = 14
+  local morph_height = 3
+  
+  -- background bar (dimmer)
   screen.level(2)
-  screen.rect(bx, by, bw, bh)
+  screen.rect(morph_x, morph_y, morph_width, morph_height)
   screen.fill()
-  screen.level(15)
-  screen.rect(bx, by, math.floor(v * bw), bh)
+  
+  -- blend fill
+  screen.level(10)
+  screen.rect(morph_x, morph_y, morph_width * morph_blend, morph_height)
+  screen.fill()
+  
+  -- scene A label (brightness inversely proportional to morph)
+  local scene_a_level = math.floor(15 * (1.0 - morph_blend))
+  screen.level(math.max(3, scene_a_level))
+  screen.move(morph_x - 12, morph_y + 6)
+  screen.font_size(6)
+  screen.text("A")
+  
+  -- scene B label (brightness proportional to morph)
+  local scene_b_level = math.floor(15 * morph_blend)
+  screen.level(math.max(3, scene_b_level))
+  screen.move(morph_x + morph_width + 2, morph_y + 6)
+  screen.font_size(6)
+  screen.text("B")
+end
+
+-- draw reorder mode visualization
+local function draw_reorder_chain()
+  if not reorder_mode then return end
+  
+  local chain_y = 32
+  local spacing = 16
+  
+  for i = 1, NUM_PAGES do
+    local x = 10 + (i - 1) * spacing
+    
+    if i == reorder_selected_slot then
+      -- pulsing selected effect
+      local pulse = 0.5 + 0.5 * math.sin(beat_phase * 4 * math.pi)
+      local level = math.floor(12 + pulse * 3)
+      screen.level(level)
+      
+      -- draw pulse box
+      screen.rect(x - 6, chain_y - 6, 12, 12)
+      screen.stroke()
+      
+      -- arrows indicating movement
+      screen.level(15)
+      if i > 1 then
+        screen.move(x - 8, chain_y)
+        screen.text("<")
+      end
+      if i < NUM_PAGES then
+        screen.move(x + 6, chain_y)
+        screen.text(">")
+      end
+    else
+      screen.level(4)
+      screen.rect(x - 6, chain_y - 6, 12, 12)
+      screen.stroke()
+    end
+    
+    screen.level(8)
+    screen.move(x - 2, chain_y + 1)
+    screen.font_size(6)
+    screen.text(tostring(effect_order[i]))
+  end
+end
+
+-- draw status strip
+local function draw_status_strip()
+  screen.level(4)
+  screen.move(2, 4)
+  screen.font_size(8)
+  screen.font_face(0)
+  screen.text("PRISMA")
+  
+  -- effect chain abbreviated names with ">" separators
+  screen.level(6)
+  screen.move(35, 4)
+  screen.font_size(6)
+  
+  local chain_text = ""
+  for i = 1, NUM_PAGES do
+    local effect_num = effect_order[i]
+    local effect_name = pages[effect_num].name
+    local abbrev = string.sub(effect_name, 1, 3):upper()
+    chain_text = chain_text .. abbrev
+    if i < NUM_PAGES then
+      chain_text = chain_text .. ">"
+    end
+  end
+  screen.text(chain_text)
+  
+  -- beat pulse dot at x=124
+  local pulse = 0.5 + 0.5 * math.sin(beat_phase * 2 * math.pi)
+  local dot_level = math.floor(8 + pulse * 7)
+  screen.level(dot_level)
+  screen.rect(124, 2, 2, 2)
   screen.fill()
 end
 
-local function draw_dots()
-  local dw  = 4
-  local gap = 3
-  local tw  = NUM_PAGES * dw + (NUM_PAGES - 1) * gap
-  local sx  = math.floor((128 - tw) / 2)
-  local sy  = 58
-  for i = 1, NUM_PAGES do
-    local x = sx + (i - 1) * (dw + gap)
-    if i == page then
-      screen.level(15)
-    else
-      screen.level(3)
-    end
-    screen.rect(x, sy, dw, 2)
-    screen.fill()
+-- draw context bar (y 53-58)
+local function draw_context_bar()
+  -- current effect name
+  local p = pages[page]
+  screen.level(8)
+  screen.move(2, 57)
+  screen.font_size(6)
+  screen.font_face(0)
+  screen.text(string.upper(p.name))
+  
+  -- morph position indicator
+  if scene_morphing then
+    screen.level(6)
+    screen.move(50, 57)
+    local morph_pct = math.floor(morph_blend * 100)
+    screen.text("MORPH: " .. morph_pct .. "%")
   end
+  
+  -- freeze state indicator
+  if freeze_state then
+    screen.level(5)
+    screen.move(100, 57)
+    screen.text("FREEZE")
+  end
+end
+
+-- draw transient parameter popup
+local function draw_popup()
+  if not popup_param or popup_time <= 0 then return end
+  
+  local popup_x = 45
+  local popup_y = 35
+  local box_w = 40
+  local box_h = 12
+  
+  -- semi-transparent background (via level)
+  screen.level(3)
+  screen.rect(popup_x, popup_y, box_w, box_h)
+  screen.fill()
+  
+  -- border
+  screen.level(12)
+  screen.rect(popup_x, popup_y, box_w, box_h)
+  screen.stroke()
+  
+  -- parameter name
+  screen.level(14)
+  screen.move(popup_x + 4, popup_y + 3)
+  screen.font_size(6)
+  screen.text(popup_param)
+  
+  -- parameter value
+  screen.level(15)
+  screen.move(popup_x + 4, popup_y + 9)
+  local val_pct = math.floor(popup_val * 100)
+  screen.text(val_pct .. "%")
 end
 
 function init()
@@ -173,12 +367,23 @@ function init()
   end
 
   local re = metro.init()
-  re.time  = 1/30
+  re.time  = 1/15  -- ~15fps for spectral animation
   re.event = function()
+    -- update beat phase for animation
+    beat_phase = (beat_phase + 1/15) % 1.0
+    
+    -- update randomize flash
     if rand_flash > 0 then
-      rand_timer = rand_timer + (1/30)
+      rand_timer = rand_timer + (1/15)
       rand_flash = math.max(0, 1.0 - rand_timer * 4)
     end
+    
+    -- update popup timeout
+    if popup_time > 0 then
+      popup_time = popup_time - (1/15)
+      if popup_time < 0 then popup_time = 0 end
+    end
+    
     redraw()
   end
   re:start()
@@ -214,6 +419,11 @@ function enc(n, d)
       -- normal mode: adjust effect parameter
       values[page] = util.clamp(values[page] + d * 0.02, 0.0, 1.0)
       send_value(page, values[page])
+      
+      -- trigger popup
+      popup_param = pages[page].label
+      popup_val = values[page]
+      popup_time = 0.8
     end
   elseif n == 3 then
     if reorder_mode then
@@ -252,81 +462,27 @@ function key(n, z)
 end
 
 function redraw()
-  local p   = pages[page]
-  local v   = values[page]
-  local pct = math.floor(v * 100)
-
+  screen.aa(1)
   screen.clear()
-
-  -- effect name (top left)
-  screen.level(4)
-  screen.move(1, 9)
-  screen.font_size(8)
-  screen.font_face(0)
-  screen.text(string.upper(p.name))
-
-  -- value number (large)
-  screen.level(15)
-  screen.move(19, 36)
-  screen.font_size(16)
-  screen.font_face(1)
-  screen.text(string.format("%3d", pct))
-
-  -- unit + param label
-  screen.level(6)
-  screen.move(53, 36)
-  screen.font_size(8)
-  screen.font_face(0)
-  screen.text("% " .. p.label)
-
-  -- desc line
-  screen.level(3)
-  screen.move(1, 51)
-  screen.font_size(8)
-  screen.font_face(0)
-  screen.text(p.desc)
-
-  -- bar
-  draw_bar(v)
-
-  -- status indicators
-  local status_y = 9
-  local status_x = 109
-
-  -- K3 randomize hint (top right), flashes on press
-  if not scene_morphing then
-    local rnd_lv = rand_flash > 0 and math.floor(rand_flash * 12) or 2
-    screen.level(rnd_lv)
-    screen.move(status_x, status_y)
-    screen.text("RND")
-  end
-
-  -- scene morphing indicator
-  if scene_morphing then
-    screen.level(12)
-    screen.move(status_x - 20, status_y)
-    screen.text("MORPH")
-  end
-
-  -- reorder mode indicator
-  if reorder_mode then
-    screen.level(10)
-    screen.move(status_x - 40, status_y)
-    screen.text("REORDER")
-  end
-
-  -- page/effect chain display
-  screen.level(2)
-  screen.move(1, 20)
-  screen.text("chain: ")
-  for i = 1, NUM_PAGES do
-    local slot_num = effect_order[i]
-    screen.text(tostring(slot_num) .. " ")
-  end
-
-  -- page dots (bottom)
-  draw_dots()
-
+  
+  -- 1. STATUS STRIP (y 0-8)
+  draw_status_strip()
+  
+  -- 2. LIVE ZONE (y 9-52) - Spectral visualization
+  draw_spectral_bars()
+  
+  -- Scene morph visualization overlay
+  draw_scene_morph()
+  
+  -- Reorder mode chain visualization
+  draw_reorder_chain()
+  
+  -- 3. CONTEXT BAR (y 53-58)
+  draw_context_bar()
+  
+  -- 4. TRANSIENT PARAMETER POPUP
+  draw_popup()
+  
   screen.update()
 end
 
